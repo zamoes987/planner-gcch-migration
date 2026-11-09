@@ -63,7 +63,7 @@ $global:Dst = @{
     newGroups = @{}; plans = @{}; planCats = @{}; buckets = @{}; tasks = @{}; details = @{}; n = 0
     throttled = $false; fail412Once = $true; memberFailOnce = $true; newPlanFailOnce = $true
     apps = @(); grants = @(); grantFailOnce = $true }
-$global:FakeMode = $null; $global:LastScopes = $null
+$global:FakeMode = $null; $global:LastScopes = $null; $global:Events = [System.Collections.Generic.List[string]]::new()
 
 function global:Connect-MgGraph { param($Environment, $TenantId, $ClientId, $CertificateThumbprint, [string[]]$Scopes, [switch]$NoWelcome, $ContextScope) $global:FakeMode = $Environment; $global:LastScopes = $Scopes }
 function global:Disconnect-MgGraph { $global:FakeMode = $null }
@@ -110,6 +110,7 @@ $global:FakeHandler = {
                 if ($q -match "mailNickname eq '([^']+)'") { $id = $global:Dst.groupNick[$Matches[1]]; $out = New-Obj @{ value = @($(if ($id) { @{ id = $id; displayName = $Matches[1] } })) } }
                 else { $out = New-Obj @{ value = @() } }; break }
             '^POST /v1.0/groups$' {
+                $global:Events.Add('group-create')
                 $id = 'g-new-' + ($global:Dst.newGroups.Count + 1); $global:Dst.newGroups[$id] = $b
                 $global:Dst.members[$id] = [System.Collections.Generic.List[string]]@($b['members@odata.bind'] | ForEach-Object { ($_ -split '/')[-1] })
                 $status = 201; $out = New-Obj @{ id = $id; displayName = $b.displayName }; break }
@@ -124,6 +125,7 @@ $global:FakeHandler = {
             '^POST /v1.0/planner/plans$' {
                 $gid = $b.container.containerId
                 if (-not $allGroups.ContainsKey($gid) -or $b.container.type -ne 'group') { throw "fake: bad container $gid" }
+                $global:Events.Add($(if ($b.title -like 'PREFLIGHT*') { "preflight-plan:$gid" } else { 'plan-create' }))
                 if ($global:Dst.newGroups.ContainsKey($gid) -and $global:Dst.newPlanFailOnce) { $global:Dst.newPlanFailOnce = $false; $status = 404; $out = New-Obj @{ error = @{ message = 'group not provisioned for Planner yet (forced)' } }; break }
                 $id = 'DP' + (++$global:Dst.n); $global:Dst.plans[$id] = $b; $out = New-Obj @{ id = $id; title = $b.title }; break }
             '^GET /v1.0/planner/plans/(DP\d+)$' { $out = New-Obj @{ id = $Matches[1]; '@odata.etag' = 'W/"p"' }; break }
@@ -212,11 +214,23 @@ $p1 = Get-Content (Join-Path $work 'export\basic\g-src-1\P1.json') -Raw | Conver
 $g2 = Get-Content (Join-Path $work 'export\basic\g-src-2\_group.json') -Raw | ConvertFrom-Json
 Check 'export: plan, comments, task chat (deleted message dropped)' ($p1.tasks.Count -eq 2 -and @($p1.tasks[0].comments).Count -eq 2 -and @($p1.tasks[0].chatPosts).Count -eq 1)
 Check 'export: group alias, visibility, owners, members captured' ($g2.mailNickname -eq 'ops' -and $g2.visibility -eq 'Public' -and ($g2.ownerIds -join ',') -eq 'u3' -and @($g2.memberIds).Count -eq 2)
-Check 'export: premium skipped cleanly when Az is unavailable' (Test-Path (Join-Path $work 'export\basic\_source-org.json'))
+$sum = Get-Content (Join-Path $work 'logs\export-summary.txt') -Raw
+Check 'export summary: basic counts, task chat count, premium SKIPPED with reason and fix' (
+    $sum -match 'Basic plans\s+: 2 plans, 3 tasks' -and $sum -match 'Task chat\s+: 1 messages' -and $sum -match 'Premium plans : SKIPPED: .*Fix: set Source\.DataverseUrl')
 $global:LastScopes = $null
+
+# ===== DRY RUN (preview, must write nothing) =====
+Run DryRun
+$gmDry = @(Import-Csv (Join-Path $work 'logs\group-mapping.csv'))
+Check 'dry run: no groups, plans or memberships created; Ops reported as "would be CREATED"' (
+    $global:Dst.newGroups.Count -eq 0 -and $global:Dst.plans.Count -eq 0 -and @($global:Dst.members['g-dst-1']).Count -eq 1 -and
+    ($gmDry | Where-Object sourceGroupId -eq 'g-src-2').method -eq 'would be CREATED' -and -not (Test-Path (Join-Path $work 'state\targets.json')))
 
 # ===== IMPORT (one command) =====
 Run Import
+Check 'GCC High write test ran in the EXISTING group before any group was created' (
+    $global:Events.IndexOf('preflight-plan:g-dst-1') -ge 0 -and $global:Events.IndexOf('preflight-plan:g-dst-1') -lt $global:Events.IndexOf('group-create'))
+Check 'import says loudly that premium plans were not imported, and why' ((Get-Content (Get-ChildItem (Join-Path $work 'logs') -Filter 'migration-*.log').FullName -Raw) -match 'PREMIUM PLANS WERE NOT IMPORTED because the export skipped them')
 $um = @(Import-Csv (Join-Path $work 'logs\user-mapping.csv'))
 Check 'users auto-mapped by domain (contoso.com -> contoso.us); deleted user reported' (
     ($um | Where-Object sourceUpn -eq 'a@contoso.com').destUpn -eq 'a@contoso.us' -and ($um | Where-Object sourceUpn -eq 'c@contoso.com').method -eq 'domain map' -and @($um | Where-Object method -eq 'NOT FOUND').Count -eq 1)

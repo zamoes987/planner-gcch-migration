@@ -38,8 +38,15 @@ Both commands are safe to rerun. They resume where they stopped and never duplic
 - **Assignees** who aren't members of their GCC High group are added to it, so their assignments work.
 - **SharePoint links** are rewritten to the GCC High host. This is a best guess from the tenant names; see §4.
 - **Premium plans:** Dataverse environments are found automatically.
-- **Before writing anything,** Import runs a throwaway test in GCC High: it creates a plan, bucket, task and details, then deletes them. If that fails, nothing is imported.
+- **The order of writes in GCC High:**
+  1. Import previews the mapping without writing anything.
+  2. It runs a throwaway write test (plan, bucket, task, details, then delete) in an **existing** matched group.
+  3. Only if that passes does it create missing groups and import.
+  4. If *no* group matched at all, it has to create the groups first so there's somewhere to test.
 - **After importing,** Import checks every plan and task and writes reports to `logs\`.
+- **Export ends with a summary** of what was exported and what was SKIPPED, with the reason and the fix. Import repeats any skipped premium export loudly.
+
+**Import changes your GCC High tenant by default:** it creates missing groups and adds assignees as group members. To see exactly what would happen without writing anything, run `.\Migrate-PlannerToGccHigh.ps1 -Step DryRun` after Export, then open `logs\group-mapping.csv`, `logs\user-mapping.csv` and `logs\basic-import-problems.csv`.
 
 ## What migrates
 
@@ -53,6 +60,7 @@ Both commands are safe to rerun. They resume where they stopped and never duplic
 | Attachment files | ⚠️ Only the link moves. Files must be migrated separately | same |
 | Created by / completed by and their dates | ❌ Set by the service to the migration app and the import time [S11] | ❌ |
 | Card order inside a bucket, task history, Teams tabs | ❌ | ❌ |
+| Plans **not owned by a Microsoft 365 group** (e.g. personal plans) | ❌ Not found by discovery, which lists group plans only | n/a |
 
 **Project Online / PWA can't be migrated.** It retired on Sept 30, 2026, and its data is no longer accessible [S1][S2].
 
@@ -100,9 +108,11 @@ Import tests it in your tenant. If the premium test fails, basic plans are still
 
 The real script runs offline against simulated versions of both clouds:
 - **44 unit tests**, all passing.
-- **23 end-to-end checks** of the two-command flow, all passing, with no config files:
-  - finding groups that have plans
+- **26 end-to-end checks** of the two-command flow, all passing, with no config files:
+  - finding groups that have plans, plus the export summary
   - exporting task chat
+  - a dry run that writes nothing
+  - the write test running before any group is created
   - matching users by domain
   - matching one group by alias and creating another
   - adding an assignee after a forced replication delay

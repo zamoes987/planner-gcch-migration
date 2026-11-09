@@ -420,8 +420,13 @@ function Get-GraphAll {
 }
 
 function Get-OrgDomains {
+    # First Graph call of Export/Import: translate a 401/403 right after Setup into plain advice.
     $tid = (Get-MgContext).TenantId
-    @((Invoke-Graph -Uri "/v1.0/organization/$tid`?`$select=verifiedDomains").verifiedDomains)
+    try { @((Invoke-Graph -Uri "/v1.0/organization/$tid`?`$select=verifiedDomains").verifiedDomains) }
+    catch {
+        if ($_.Exception.Data['StatusCode'] -in 401, 403) { throw "The migration app's permissions aren't active yet (HTTP $($_.Exception.Data['StatusCode'])). If Setup just ran, wait 5 minutes and rerun. Otherwise rerun -Step Setup for this side." }
+        throw
+    }
 }
 
 #endregion
@@ -774,6 +779,7 @@ function Invoke-StepExportBasic {
         catch { $users[$Id] = @{ upn = $null; displayName = $null; mail = $null }; Write-MigLog WARN "Source user $Id not resolvable (deleted?)" }
     }
     $inventoryPath = Join-Path $outRoot 'inventory.csv'
+    $planCount = 0; $taskCount = 0; $skipped = 0
     foreach ($g in $groupRows) {
         $gid = $g.sourceGroupId
         try {
@@ -789,7 +795,7 @@ function Invoke-StepExportBasic {
                 ConvertTo-Json -Depth 5 | Set-Content (Join-Path $dir '_group.json') -Encoding utf8
             $plans = Get-GraphAll -Uri "/v1.0/groups/$gid/planner/plans"
         }
-        catch { Write-MigLog ERROR "Group $($g.sourceDisplayName) ($gid) skipped: $($_.Exception.Message)"; Add-CsvRow $problems ([pscustomobject]@{ group = $gid; plan = ''; issue = $_.Exception.Message }); continue }
+        catch { $skipped++; Write-MigLog ERROR "Group $($g.sourceDisplayName) ($gid) skipped: $($_.Exception.Message)"; Add-CsvRow $problems ([pscustomobject]@{ group = $gid; plan = ''; issue = $_.Exception.Message }); continue }
         Write-MigLog INFO "Group $($info.displayName) ($gid): $($plans.Count) plan(s)"
         foreach ($plan in $plans) {
             try {
@@ -820,12 +826,14 @@ function Invoke-StepExportBasic {
                     references = ($tasks | Measure-Object -Property referenceCount -Sum).Sum
                     tasksWithCommentThreads = $threads; commentPosts = $commentPosts; exportedAtUtc = $record.exportedAtUtc })
                 Write-MigLog OK "Exported '$($plan.title)': $($buckets.Count) buckets, $($tasks.Count) tasks, $commentPosts comment posts"
+                $planCount++; $taskCount += $tasks.Count
             }
-            catch { Write-MigLog ERROR "Plan '$($plan.title)' skipped: $($_.Exception.Message)"; Add-CsvRow $problems ([pscustomobject]@{ group = $gid; plan = $plan.title; issue = $_.Exception.Message }) }
+            catch { $skipped++; Write-MigLog ERROR "Plan '$($plan.title)' skipped: $($_.Exception.Message)"; Add-CsvRow $problems ([pscustomobject]@{ group = $gid; plan = $plan.title; issue = $_.Exception.Message }) }
         }
     }
     $users | ConvertTo-Json -Depth 5 | Set-Content -Path $usersPath -Encoding utf8
     Write-MigLog OK "Basic export complete -> $outRoot"
+    return [pscustomobject]@{ Plans = $planCount; Tasks = $taskCount; Skipped = $skipped }
 }
 
 function Invoke-StepExportTaskChat {
@@ -862,6 +870,7 @@ function Invoke-StepExportTaskChat {
         $rec | ConvertTo-Json -Depth 40 | Set-Content -Path $f.FullName -Encoding utf8
     }
     Write-MigLog OK "Task chat export done: $total messages. Tasks this user couldn't read: $problems"
+    return $total
 }
 
 function Invoke-StepExportPremium {
@@ -944,17 +953,33 @@ function Invoke-StepExportPremium {
         }
     }
     Write-MigLog OK "Premium export complete: $exported plan(s) -> $outRoot"
+    return $exported
 }
 
 function Invoke-StepExport {
-    # One command for the commercial side.
+    # One command for the commercial side. Ends with a summary that makes any skipped part impossible to miss.
     Initialize-Prerequisites @('Graph')
     $s = Read-MigrationSettings -Path $SettingsPath
     Confirm-AppReady 'Source'
-    Invoke-StepExportBasic
-    try { Invoke-StepExportTaskChat } catch { Write-MigLog WARN "Task chat export skipped: $($_.Exception.Message). Older comments are still exported; run -Step ExportTaskChat to retry." }
-    try { Invoke-StepExportPremium } catch { Write-MigLog WARN "Premium plan export skipped: $($_.Exception.Message). Run -Step ExportPremium to retry." }
-    Write-MigLog OK "EXPORT FINISHED. Next, on this same machine and Windows account: .\Migrate-PlannerToGccHigh.ps1 -Step Import"
+    $basic = Invoke-StepExportBasic
+    $chat = 'ok'; $chatCount = 0; $prem = 'ok'; $premCount = 0
+    try { $chatCount = Invoke-StepExportTaskChat }
+    catch { $chat = "SKIPPED: $($_.Exception.Message). Fix: sign in as a member of the groups, then run -Step ExportTaskChat (older comments are exported either way)." }
+    try { $premCount = Invoke-StepExportPremium }
+    catch { $prem = "SKIPPED: $($_.Exception.Message). Fix: set Source.DataverseUrl in config\settings.json (Power Platform admin center > Environments), then run -Step ExportPremium." }
+    @{ exportedAtUtc = (Get-Date).ToUniversalTime().ToString('o'); basicPlans = $basic.Plans; basicTasks = $basic.Tasks; basicSkipped = $basic.Skipped
+       taskChat = $chat; taskChatMessages = $chatCount; premium = $prem; premiumPlans = $premCount } |
+        ConvertTo-Json | Set-Content (Join-Path $s.StateFolder 'export-status.json') -Encoding utf8
+    $lines = @(
+        '===================== EXPORT SUMMARY =====================',
+        "Basic plans   : $($basic.Plans) plans, $($basic.Tasks) tasks$(if ($basic.Skipped) { "  ($($basic.Skipped) SKIPPED - see logs\export-problems.csv)" })",
+        "Task chat     : $(if ($chat -eq 'ok') { "$chatCount messages" } else { $chat })",
+        "Premium plans : $(if ($prem -eq 'ok') { "$premCount plans" } else { $prem })",
+        '==========================================================')
+    $lines | Set-Content (Join-Path $s.LogFolder 'export-summary.txt') -Encoding utf8
+    $allOk = ($chat -eq 'ok') -and ($prem -eq 'ok') -and -not $basic.Skipped
+    foreach ($l in $lines) { Write-MigLog $(if ($allOk) { 'OK' } else { 'WARN' }) $l }
+    Write-MigLog OK "Next, on this same machine and Windows account: .\Migrate-PlannerToGccHigh.ps1 -Step Import"
 }
 
 #endregion
@@ -1313,7 +1338,7 @@ function Get-DestinationDataverseUrl($s) {
     throw "Several GCC High environments have premium plans: $($cands -join ', '). Set Destination.DataverseUrl in config\settings.json."
 }
 
-function Invoke-StepPreflight([switch]$DestinationOnly, [string]$ForScope) {
+function Invoke-StepPreflight([switch]$DestinationOnly, [string]$ForScope, [string]$TestGroupId, [bool]$TestGroupIsNew) {
     $s = Read-MigrationSettings -Path $SettingsPath
     $cfgDir = Split-Path $SettingsPath -Parent
     $scopeNow = if ($ForScope) { $ForScope } else { $Scope }
@@ -1345,7 +1370,7 @@ function Invoke-StepPreflight([switch]$DestinationOnly, [string]$ForScope) {
             Add-Result 'Basic-Source' 'sampled tasks with a comment thread' 'INFO' "$withThread of $sampled"
         }
         if (Test-Step 'Basic-Dest' 'connect app-only (GCC High)' { Connect-GraphApp -Side $s.Destination; (Get-MgContext).TenantId }) {
-            $tg = $s.PreflightTestGroupId; $tgNew = $false
+            $tg = if ($TestGroupId) { $TestGroupId } else { $s.PreflightTestGroupId }; $tgNew = $TestGroupIsNew
             if (-not $tg) {
                 $tp = Join-Path $s.StateFolder 'targets.json'
                 if (Test-Path $tp) {
@@ -1648,17 +1673,34 @@ function Invoke-StepImport {
     $s = Read-MigrationSettings -Path $SettingsPath
     if (-not (Test-Path (Join-Path $s.ExportFolder 'basic\users.json'))) { throw "No export found in $($s.ExportFolder). Run -Step Export first (same machine, same Windows account)." }
     Confirm-AppReady 'Destination'
-    $null = Invoke-StepMapTargets
     $hasPremium = [bool](Get-ChildItem -Path (Join-Path $s.ExportFolder 'premium') -Filter '*.json' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '_*' })
-    $pf = Invoke-StepPreflight -DestinationOnly -ForScope $(if ($hasPremium) { 'All' } else { 'Basic' })
+    # 1) Preview the mapping without writing. 2) Test GCC High writes in an EXISTING matched group (throwaway plan).
+    # 3) Only then create missing groups and import. If no group matched, one group must be created first to test in.
+    $preview = Invoke-StepMapTargets -DryRun
+    $testGroup = if ($s.PreflightTestGroupId) { $s.PreflightTestGroupId } else { @($preview.groups.Values | ForEach-Object { $_.destGroupId })[0] }
+    $testIsNew = $false
+    if (-not $testGroup) {
+        Write-MigLog WARN 'No existing GCC High group matched, so groups are created BEFORE the write test (a test needs a group).'
+        $real = Invoke-StepMapTargets
+        $first = @($real.groups.Values)[0]
+        if ($first) { $testGroup = $first.destGroupId; $testIsNew = [bool]$first.created }
+    }
+    $pf = Invoke-StepPreflight -DestinationOnly -ForScope $(if ($hasPremium) { 'All' } else { 'Basic' }) -TestGroupId $testGroup -TestGroupIsNew $testIsNew
     $basicFail = @($pf | Where-Object { $_.area -eq 'Basic-Dest' -and $_.status -eq 'FAIL' -and $_.check -notlike 'delete*' })
-    if ($basicFail) { throw "Preflight failed in GCC High ($($basicFail[0].check): $($basicFail[0].detail)). Nothing was imported. If Setup just ran, wait 5 minutes and rerun -Step Import." }
+    if ($basicFail) { throw "Preflight failed in GCC High ($($basicFail[0].check): $($basicFail[0].detail)). No plans were imported$(if (-not $testIsNew) { ' and no groups were created' }). If Setup just ran, wait 5 minutes and rerun -Step Import." }
+    $null = Invoke-StepMapTargets
     Invoke-StepImportBasic
     $vf = Invoke-StepVerify
     if ($hasPremium) {
         $premOk = -not @($pf | Where-Object { $_.area -like 'Premium*' -and $_.status -eq 'FAIL' })
         if ($premOk) { Invoke-StepImportPremium }
         else { Write-MigLog WARN 'Premium plans NOT imported: the GCC High premium preflight failed (see logs\preflight.csv). Basic plans are done. export\premium\ keeps the data.' }
+    }
+    else {
+        $es = Join-Path $s.StateFolder 'export-status.json'
+        $st = if (Test-Path $es) { Get-Content $es -Raw | ConvertFrom-Json }
+        if ($st -and $st.premium -ne 'ok') { Write-MigLog WARN "PREMIUM PLANS WERE NOT IMPORTED because the export skipped them: $($st.premium)" }
+        else { Write-MigLog INFO 'No premium plans were found in the commercial tenant, so none were imported.' }
     }
     Write-MigLog OK "IMPORT FINISHED. Review: logs\user-mapping.csv, logs\group-mapping.csv, logs\verify-basic.csv ($vf FAIL), logs\*problems.csv"
 }
@@ -1676,9 +1718,9 @@ switch ($Step) {
     'Setup' { Invoke-StepSetup -SetupSide $Side }
     'Discover' { Invoke-StepDiscover }
     'Preflight' { Invoke-StepPreflight | Out-Null }
-    'ExportBasic' { Invoke-StepExportBasic }
-    'ExportTaskChat' { Invoke-StepExportTaskChat }
-    'ExportPremium' { Invoke-StepExportPremium }
+    'ExportBasic' { $null = Invoke-StepExportBasic }
+    'ExportTaskChat' { $null = Invoke-StepExportTaskChat }
+    'ExportPremium' { $null = Invoke-StepExportPremium }
     'MapTargets' { $null = Invoke-StepMapTargets }
     'DryRun' { Invoke-StepImportBasic -DryRun }
     'ImportBasic' { Invoke-StepImportBasic }

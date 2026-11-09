@@ -1,0 +1,10 @@
+# Tenant data and secrets never go in source control
+export/
+state/
+logs/
+config/settings.json
+config/users.csv
+config/groups.csv
+config/groups.discovered.csv
+config/urlmap.csv
+config/premium-projects.csv

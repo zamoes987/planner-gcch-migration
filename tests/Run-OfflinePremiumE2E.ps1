@@ -1,7 +1,8 @@
 #Requires -Version 7.4
 <#
-  Offline end-to-end test of the PREMIUM path: 4-Export-Premium -> 5-Import-Premium (run twice) against an
-  in-memory fake of the Dataverse Web API + Project schedule API actions.
+  Offline end-to-end test of the PREMIUM path: ExportPremium -> ImportPremium (run twice) -> Preflight, with Dataverse
+  environments found through the (fake) Global Discovery Service, against an in-memory fake of the Dataverse Web API
+  + Project schedule API actions.
   The fake metadata below is deliberately partly invented (e.g. label/checklist column names) to prove the
   scripts read names from metadata instead of assuming them. The fake also enforces that every
   @odata.bind target already exists or was queued earlier in the same OperationSet, and <=200 ops per set.
@@ -12,8 +13,8 @@ $repo = Split-Path -Parent $PSScriptRoot
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("gcch-pe2e-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path (Join-Path $work 'config') -Force | Out-Null
 @{
-    Source = @{ TenantId = 'src'; AzEnvironment = 'AzureCloud'; DataverseUrl = 'https://src.crm.dynamics.com/' }
-    Destination = @{ TenantId = 'dst'; AzEnvironment = 'AzureUSGovernment'; DataverseUrl = 'https://dst.crm.microsoftdynamics.us/' }
+    Source = @{ TenantId = 'src'; AzEnvironment = 'AzureCloud'; DataverseUrl = '' }               # discovered
+    Destination = @{ TenantId = 'dst'; AzEnvironment = 'AzureUSGovernment'; DataverseUrl = '' }   # discovered
     DomainMap = @{}; ExportFolder = 'export'; StateFolder = 'state'; LogFolder = 'logs'
     Premium = @{ ExtraColumns = @{ msdyn_projecttask = @('msdyn_description', 'msdyn_progress') }; OperationSetChunkSize = 3; WaitForOperationSetMinutes = 1 }
 } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $work 'config\settings.json')
@@ -53,10 +54,12 @@ $global:SrcRows = @{
     msdyn_projectlabels           = @(New-Row msdyn_projectlabel @{ msdyn_projectlabelid = 'l1'; msdyn_projectlabeltext = 'Urgent' } @{ msdyn_project = 'p1' })
     msdyn_projecttasktolabels     = @(New-Row msdyn_projecttasktolabel @{ msdyn_projecttasktolabelid = 'tl1' } @{ msdyn_project = 'p1'; msdyn_projecttask = 't1'; msdyn_projectlabel = 'l1' })
 }
-$global:Dst = @{ rows = @{}; payloads = @{}; opsets = @{}; pss = 0; createProject = 0 }
+$global:Dst = @{ rows = @{}; payloads = @{}; opsets = @{}; pss = 0; createProject = 0; deleted = @() }; $global:GdsCalls = 0
 $global:DvMode = $null
 
-function global:Connect-AzAccount { param($Environment, $Tenant, $Scope) $global:DvMode = $Environment }
+$global:AzCtx = $null; $global:AzConnects = 0
+function global:Connect-AzAccount { param($Environment, $Tenant, $Scope) $global:AzConnects++; $global:AzCtx = [pscustomobject]@{ Environment = [pscustomobject]@{ Name = $Environment }; Tenant = [pscustomobject]@{ Id = $Tenant } } }
+function global:Get-AzContext { $global:AzCtx }
 function global:Get-AzAccessToken { param($ResourceUrl, [switch]$AsSecureString)
     [pscustomobject]@{ Token = (ConvertTo-SecureString 'fake' -AsPlainText -Force); ExpiresOn = [DateTimeOffset]::Now.AddHours(1) } }
 $global:Login = [System.Collections.Generic.List[object]]::new(); $global:LastAuth = @{}; $global:PendingOnce = $true
@@ -72,8 +75,21 @@ function global:Invoke-WebRequest {
         $st = if ($o.error) { 400 } else { 200 }
         return [pscustomobject]@{ StatusCode = $st; Content = ($o | ConvertTo-Json); Headers = @{} }
     }
-    $side = if ($Uri.StartsWith('https://src.crm.dynamics.com/api/data/v9.2/')) { 'src' } elseif ($Uri.StartsWith('https://dst.crm.microsoftdynamics.us/api/data/v9.2/')) { 'dst' } else { throw "fake dv: unexpected host $Uri" }
+    # --- Global Discovery Service (per cloud) ---
+    if ($Uri -match '^https://globaldisco\.crm\.(dynamics\.com|microsoftdynamics\.us)/api/discovery/v2\.0/Instances') {
+        $global:GdsCalls++
+        $v = if ($Matches[1] -eq 'dynamics.com') {
+            @(@{ Url = 'https://src.crm.dynamics.com'; FriendlyName = 'Contoso (default)'; State = 0 }, @{ Url = 'https://empty.crm.dynamics.com'; FriendlyName = 'Sandbox'; State = 0 }, @{ Url = 'https://off.crm.dynamics.com'; FriendlyName = 'Disabled'; State = 1 })
+        } else { @(@{ Url = 'https://dst.crm.microsoftdynamics.us'; FriendlyName = 'Contoso GCCH (default)'; State = 0 }) }
+        return [pscustomobject]@{ StatusCode = 200; Content = (@{ value = $v } | ConvertTo-Json -Depth 5); Headers = @{} }
+    }
+    $side = if ($Uri.StartsWith('https://src.crm.dynamics.com/api/data/v9.2/')) { 'src' } elseif ($Uri.StartsWith('https://dst.crm.microsoftdynamics.us/api/data/v9.2/')) { 'dst' }
+            elseif ($Uri.StartsWith('https://empty.crm.dynamics.com/api/data/v9.2/')) { 'empty' } else { throw "fake dv: unexpected host $Uri" }
     $global:LastAuth[$side] = $Headers.Authorization
+    if ($side -eq 'empty') {   # an environment without the Project solution
+        $o = if ($Uri -match 'WhoAmI$') { @{ UserId = 'u-empty' } } else { @{ error = @{ message = 'no such table' } } }
+        return [pscustomobject]@{ StatusCode = $(if ($o.error) { 404 } else { 200 }); Content = ($o | ConvertTo-Json); Headers = @{} }
+    }
     $rel = $Uri.Substring($Uri.IndexOf('/api/data/v9.2/') + '/api/data/v9.2/'.Length)
     $b = if ($Body) { [System.Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json -AsHashtable } else { $null }
     $status = 200; $out = $null
@@ -91,7 +107,18 @@ function global:Invoke-WebRequest {
         '^GET bookableresources\?\$select=bookableresourceid&\$filter=_userid_value eq su1$' { $out = @{ value = @(@{ bookableresourceid = 'br1' }) }; break }
         '^GET (\w+)$' { $out = @{ value = @($global:SrcRows[$Matches[1]]) }; break }
         '^GET (\w+)\(([\w-]+)\)\?\$select=' { if ($global:Dst.rows.ContainsKey($Matches[2])) { $out = @{ id = $Matches[2] } } else { $status = 404; $out = @{ error = @{ message = 'not found' } } }; break }
-        '^POST msdyn_CreateProjectV1$' { $global:Dst.createProject++; $id = if ($b.Project.msdyn_projectid) { $b.Project.msdyn_projectid } else { [guid]::NewGuid().ToString() }; $global:Dst.rows[$id] = 'msdyn_project'; $global:Dst.payloads[$id] = $b.Project; $out = @{ ProjectId = $id }; break }
+        '^GET (\w+)\?\$select=(\w+)&\$filter=_(\w+)_value eq ([\w-]+)$' {   # destination-side lookups (default-bucket cleanup)
+            $setName = $Matches[1]; $pkName = $Matches[2]; $attr = $Matches[3]; $val = $Matches[4]
+            $tbl = ($global:Meta.GetEnumerator() | Where-Object { $_.Value.set -eq $setName }).Key
+            $ids = @($global:Dst.rows.GetEnumerator() | Where-Object { $_.Value -eq $tbl -and $global:Dst.payloads[$_.Key]["$attr@odata.bind"] -match "\($([regex]::Escape($val))\)$" } | ForEach-Object { $_.Key })
+            $out = @{ value = @($ids | ForEach-Object { @{ $pkName = $_ } }) }; break }
+        '^POST msdyn_CreateProjectV1$' {
+            $global:Dst.createProject++; $id = if ($b.Project.msdyn_projectid) { $b.Project.msdyn_projectid } else { [guid]::NewGuid().ToString() }
+            $global:Dst.rows[$id] = 'msdyn_project'; $global:Dst.payloads[$id] = $b.Project
+            # Learn: CreateProjectV1 also creates the default project bucket.
+            $global:Dst.rows["defb-$id"] = 'msdyn_projectbucket'; $global:Dst.payloads["defb-$id"] = @{ msdyn_name = 'Bucket 1'; 'msdyn_project@odata.bind' = "/msdyn_projects($id)" }
+            $out = @{ ProjectId = $id }; break }
+        '^POST msdyn_PssDeleteV1$' { $global:Dst.opsets[$b.OperationSetId].Add(@{ id = $b.RecordId; table = $b.EntityLogicalName; delete = $true }); $out = @{ OperationSetResponse = '{}' }; break }
         '^POST msdyn_CreateTeamMemberV1$' {
             $tm = $b.TeamMember
             if (-not ($tm['msdyn_project@odata.bind'] -match '\(([\w-]+)\)$' -and $global:Dst.rows.ContainsKey($Matches[1]))) { $status = 400; $out = @{ error = @{ message = 'team member: project missing' } }; break }
@@ -109,7 +136,11 @@ function global:Invoke-WebRequest {
             }
             if ($status -ne 200) { break }
             $q.Add(@{ id = $e[$pk]; table = $table; payload = $e }); $out = @{ OperationSetResponse = '{}' }; break }
-        '^POST msdyn_ExecuteOperationSetV1$' { foreach ($x in $global:Dst.opsets[$b.OperationSetId]) { $global:Dst.rows[$x.id] = $x.table; $global:Dst.payloads[$x.id] = $x.payload }; $status = 200; $out = @{}; break }
+        '^POST msdyn_ExecuteOperationSetV1$' {
+            foreach ($x in $global:Dst.opsets[$b.OperationSetId]) {
+                if ($x.delete) { $global:Dst.rows.Remove($x.id); $global:Dst.deleted += , $x.id } else { $global:Dst.rows[$x.id] = $x.table; $global:Dst.payloads[$x.id] = $x.payload }
+            }
+            $status = 200; $out = @{}; break }
         '^POST msdyn_AbandonOperationSetV1$' { $out = @{}; break }
         default { throw "fake dv: unhandled $Method $rel" }
     }
@@ -123,7 +154,9 @@ $script = Join-Path $repo 'Migrate-PlannerToGccHigh.ps1'
 function Run([string]$Step, [hashtable]$Extra = @{}) { & $script -Step $Step -SettingsPath $settings @Extra }
 
 Run ExportPremium
-$ex =Get-Content (Join-Path $work 'export\premium\p1.json') -Raw | ConvertFrom-Json
+$inv = @(Import-Csv (Join-Path $work 'export\premium\inventory.csv'))
+Check 'export: environments discovered (GDS); empty and disabled environments skipped; one Az sign-in' ($global:GdsCalls -ge 1 -and $inv.Count -eq 1 -and $inv[0].environment -eq 'https://src.crm.dynamics.com' -and $global:AzConnects -eq 1)
+$ex = Get-Content (Join-Path $work 'export\premium\p1.json') -Raw | ConvertFrom-Json
 Check 'export: 3 tasks, checklist found via task-lookup In() query' (@($ex.tables.msdyn_projecttask).Count -eq 3 -and @($ex.tables.msdyn_projectchecklist).Count -eq 1)
 $labels = @(Import-Csv (Join-Path $work 'export\premium\labels-manual.csv'))
 Check 'labels-manual.csv uses the discovered label name column' ($labels.Count -eq 1 -and $labels[0].label -eq 'Urgent' -and $labels[0].task -eq 'Design')
@@ -141,21 +174,25 @@ Check 'assignment bound to task, team member, project' ($p['ra1']['msdyn_taskid@
 $probPath = Join-Path $work 'logs\premium-import-problems.csv'
 $probs = if (Test-Path $probPath) { @(Import-Csv $probPath) } else { @() }
 Check 'no PssCreate rejections or missing rows' (@($probs | Where-Object { $_.issue -match 'rejected|not present' }).Count -eq 0)
+Check 'empty default bucket from CreateProjectV1 deleted (PssDeleteV1); migrated bucket kept' ('defb-p1' -in $global:Dst.deleted -and -not $r.ContainsKey('defb-p1') -and $r.ContainsKey('b1'))
+$vp = @(Import-Csv (Join-Path $work 'logs\verify-premium.csv'))
+Check 'verify-premium.csv: PASS 8/8 (child rows; the project itself is checked above)' ($vp[0].result -eq 'PASS' -and $vp[0].rowsPresent -eq '8' -and $vp[0].rowsExpected -eq '8')
+Check 'destination environment discovered in the US Gov cloud; one Az sign-in per cloud' ($global:AzCtx.Environment.Name -eq 'AzureUSGovernment' -and $global:AzConnects -eq 2)
 
 $pssBefore = $global:Dst.pss; $cpBefore = $global:Dst.createProject
 Run ImportPremium
-Check 'rerun: zero PssCreate and zero CreateProject calls (idempotent)' ($global:Dst.pss -eq $pssBefore -and $global:Dst.createProject -eq $cpBefore)
+Check 'rerun: zero PssCreate and zero CreateProject calls, no new sign-in (idempotent)' ($global:Dst.pss -eq $pssBefore -and $global:Dst.createProject -eq $cpBefore -and $global:AzConnects -eq 2)
 
 Run Preflight @{ Scope = 'Premium' }
 $pf = @(Import-Csv (Join-Path $work 'logs\preflight.csv'))
 function Get-Status([string]$Check) { ($pf | Where-Object check -like "$Check*" | Select-Object -First 1).status }
-Check 'preflight: source sign-in + project count' ((Get-Status 'sign in + WhoAmI (AzureCloud)') -eq 'PASS' -and ($pf | Where-Object check -eq 'count premium plans').detail -like '1 projects*')
+Check 'preflight: source sign-in + premium plan count across discovered environments' ((Get-Status 'sign in + find premium plans') -eq 'PASS' -and ($pf | Where-Object check -like 'sign in + find premium plans*').detail -like '1 projects*')
 Check 'preflight: destination canary (project, team member, operation set read-back) PASS' (
     (Get-Status 'msdyn_CreateProjectV1') -eq 'PASS' -and (Get-Status 'msdyn_CreateTeamMemberV1') -eq 'PASS' -and (Get-Status 'OperationSet') -eq 'PASS')
-Check 'preflight: named bookable resource lookup' ((Get-Status 'bookable resource for a@contoso.us') -eq 'PASS')
 
-# Device-code fallback for the GCC High Dataverse sign-in (no Az.Accounts dependency).
+# Device-code fallback for the GCC High Dataverse sign-in (no Az.Accounts dependency; needs the URL set).
 $j = Get-Content $settings -Raw | ConvertFrom-Json
+$j.Destination.DataverseUrl = 'https://dst.crm.microsoftdynamics.us/'
 $j.Destination | Add-Member -NotePropertyName DataverseAuth -NotePropertyValue 'DeviceCode' -Force
 $j.Destination | Add-Member -NotePropertyName DataverseClientId -NotePropertyValue 'pc-1' -Force
 $j | ConvertTo-Json -Depth 8 | Set-Content $settings

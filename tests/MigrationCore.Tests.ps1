@@ -58,13 +58,37 @@ Describe 'Get-MappedUrl' {
     }
 }
 
-Describe 'Resolve-DestUpn' {
-    $um = @{ 'jane@contoso.com' = 'jdoe@contoso.us' }
-    $dm = @{ 'contoso.com' = 'contoso.us' }
-    It 'prefers users.csv' { Resolve-DestUpn 'Jane@Contoso.com' $um $dm | Should Be 'jdoe@contoso.us' }
-    It 'falls back to the domain map' { Resolve-DestUpn 'bob@contoso.com' $um $dm | Should Be 'bob@contoso.us' }
-    It 'returns null when nothing maps' { Resolve-DestUpn 'x@fabrikam.com' $um $dm | Should BeNullOrEmpty }
-    It 'returns null for empty input' { Resolve-DestUpn '' $um $dm | Should BeNullOrEmpty }
+Describe 'Automatic mapping (no input needed)' {
+    $src = @([pscustomobject]@{ name = 'contoso.com'; isDefault = $true; isInitial = $false }, [pscustomobject]@{ name = 'contoso.onmicrosoft.com'; isDefault = $false; isInitial = $true })
+    $dst = @([pscustomobject]@{ name = 'contoso.us'; isDefault = $true; isInitial = $false }, [pscustomobject]@{ name = 'contosogov.onmicrosoft.us'; isDefault = $false; isInitial = $true })
+    It 'maps every source domain to the destination default domain' {
+        $m = Get-AutoDomainMap -SourceDomains $src -DestDomains $dst
+        $m['contoso.com'] | Should Be 'contoso.us'
+        $m['contoso.onmicrosoft.com'] | Should Be 'contoso.us'
+    }
+    It 'derives SharePoint and OneDrive hosts from the initial domains' {
+        $u = @(Get-SharePointUrlMap -SourceDomains $src -DestDomains $dst)
+        $u[0].sourcePrefix | Should Be 'https://contoso.sharepoint.com/'
+        $u[0].destPrefix | Should Be 'https://contosogov.sharepoint.us/'
+        $u[1].destPrefix | Should Be 'https://contosogov-my.sharepoint.us/'
+    }
+    It 'returns no URL map when an initial domain is unknown' { @(Get-SharePointUrlMap -SourceDomains @() -DestDomains $dst).Count | Should Be 0 }
+    It 'user candidates: users.csv wins outright' {
+        $c = Get-UserMatchCandidates -SourceUser @{ upn = 'Jane@Contoso.com' } -DestDomains @('contoso.us') -UserMap @{ 'jane@contoso.com' = 'jdoe@contoso.us' }
+        $c.Count | Should Be 1
+        $c[0].Upn | Should Be 'jdoe@contoso.us'
+    }
+    It 'user candidates: domain map, then same alias on each destination domain, then mail alias, no duplicates' {
+        $c = Get-UserMatchCandidates -SourceUser @{ upn = 'jane@contoso.com'; mail = 'jane.doe@contoso.com' } -DestDomains @('contoso.us', 'contosogov.onmicrosoft.us') -DomainMap @{ 'contoso.com' = 'contoso.us' }
+        ($c | ForEach-Object { $_.Upn }) -join ',' | Should Be 'jane@contoso.us,jane@contosogov.onmicrosoft.us,jane.doe@contoso.us,jane.doe@contosogov.onmicrosoft.us'
+        $c[0].Method | Should Be 'domain map'
+    }
+    It 'escapes quotes for OData filters' { ConvertTo-ODataString "O'Brien" | Should Be "O''Brien" }
+    It 'uses the right Graph and discovery endpoints per cloud' {
+        Get-GraphBaseUrl 'USGov' | Should Be 'https://graph.microsoft.us'
+        Get-GlobalDiscoUrl 'AzureUSGovernment' | Should Be 'https://globaldisco.crm.microsoftdynamics.us'
+        Get-GlobalDiscoUrl 'AzureCloud' | Should Be 'https://globaldisco.crm.dynamics.com'
+    }
 }
 
 Describe 'Order hints (Graph docs: Using order hints in Planner)' {
@@ -116,11 +140,14 @@ Describe 'Split-IntoChunks' {
 
 Describe 'Get-PlannerAssignmentsBody' {
     $src = [pscustomobject]@{ 'u1' = [pscustomobject]@{ orderHint = 'x' }; 'u2' = [pscustomobject]@{ orderHint = 'y' } }
-    $r = Get-PlannerAssignmentsBody -SourceAssignments $src -SourceUserUpn @{ u1 = 'a@contoso.com'; u2 = 'b@fabrikam.com' } `
-        -DestUserIdByUpn @{ 'a@contoso.us' = 'd1' } -DomainMap @{ 'contoso.com' = 'contoso.us' }
+    $r = Get-PlannerAssignmentsBody -SourceAssignments $src -DestIdBySourceId @{ u1 = 'd1' } -SourceUpnById @{ u1 = 'a@contoso.com'; u2 = 'b@fabrikam.com' }
     It 'maps resolvable assignees to destination IDs' { @($r.Body.Keys) -join ',' | Should Be 'd1' }
     It 'uses the plannerAssignment odata type' { $r.Body['d1']['@odata.type'] | Should Be '#microsoft.graph.plannerAssignment' }
     It 'reports unmapped assignees' { $r.Unmapped -join ',' | Should Be 'b@fabrikam.com' }
+    It 'can restrict to current group members (fallback attempt)' {
+        $r2 = Get-PlannerAssignmentsBody -SourceAssignments $src -DestIdBySourceId @{ u1 = 'd1'; u2 = 'd2' } -OnlyDestIds @('d2')
+        @($r2.Body.Keys) -join ',' | Should Be 'd2'
+    }
 }
 
 Describe 'Get-TaskDetailsBody' {

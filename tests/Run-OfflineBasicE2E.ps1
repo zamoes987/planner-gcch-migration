@@ -220,7 +220,11 @@ Check 'export summary: basic counts, task chat count, premium SKIPPED with reaso
 $global:LastScopes = $null
 
 # ===== DRY RUN (preview, must write nothing) =====
+# Fresh machine for GCC High: no app registered yet. DryRun must register it (as Import does) instead of failing sign-in.
+$raw = Get-Content $settings -Raw | ConvertFrom-Json; $raw.Destination.ClientId = ''; $raw | ConvertTo-Json -Depth 8 | Set-Content $settings
 Run DryRun
+Check 'dry run on a fresh machine: registered the GCC High app first instead of failing sign-in' (
+    (Get-Content $settings -Raw | ConvertFrom-Json).Destination.ClientId -eq 'app-123' -and $global:Dst.apps.Count -eq 1)
 $gmDry = @(Import-Csv (Join-Path $work 'logs\group-mapping.csv'))
 Check 'dry run: no groups, plans or memberships created; Ops reported as "would be CREATED"' (
     $global:Dst.newGroups.Count -eq 0 -and $global:Dst.plans.Count -eq 0 -and @($global:Dst.members['g-dst-1']).Count -eq 1 -and
@@ -267,6 +271,7 @@ $v = @(Import-Csv (Join-Path $work 'logs\verify-basic.csv'))
 Check 'verify: zero FAIL (expected assignees = mapped users)' (@($v | Where-Object result -eq 'FAIL').Count -eq 0 -and $v.Count -gt 10)
 
 # ===== Setup (idempotent app registration) =====
+$global:Dst.apps = @(); $global:Dst.grants = @(); $global:Dst.grantFailOnce = $true   # measure this one Setup run
 Run Setup @{ Side = 'Destination' }
 $cfg = (Get-Content $settings -Raw | ConvertFrom-Json).Destination
 $app = $global:Dst.apps[0]

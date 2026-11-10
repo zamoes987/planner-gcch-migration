@@ -46,7 +46,7 @@ Both commands are safe to rerun. They resume where they stopped and never duplic
 - **After importing,** Import checks every plan and task and writes reports to `logs\`.
 - **Export ends with a summary** of what was exported and what was SKIPPED, with the reason and the fix. Import repeats any skipped premium export loudly.
 
-**Import changes your GCC High tenant by default:** it creates missing groups and adds assignees as group members. To see exactly what would happen without writing anything, run `.\Migrate-PlannerToGccHigh.ps1 -Step DryRun` after Export, then open `logs\group-mapping.csv`, `logs\user-mapping.csv` and `logs\basic-import-problems.csv`.
+**Import changes your GCC High tenant by default:** it creates missing groups and adds assignees as group members. To see exactly what would happen first, run `.\Migrate-PlannerToGccHigh.ps1 -Step DryRun` after Export, then open `logs\group-mapping.csv`, `logs\user-mapping.csv` and `logs\basic-import-problems.csv`. DryRun creates no groups, plans or memberships. On a machine's first run it does register the GCC High migration app (the same admin sign-in Import would ask for).
 
 ## What migrates
 
@@ -108,10 +108,10 @@ Import tests it in your tenant. If the premium test fails, basic plans are still
 
 The real script runs offline against simulated versions of both clouds:
 - **44 unit tests**, all passing.
-- **26 end-to-end checks** of the two-command flow, all passing, with no config files:
+- **27 end-to-end checks** of the two-command flow, all passing, with no config files:
   - finding groups that have plans, plus the export summary
   - exporting task chat
-  - a dry run that writes nothing
+  - a dry run on a fresh machine: registers the GCC High app, writes no Planner data
   - the write test running before any group is created
   - matching users by domain
   - matching one group by alias and creating another

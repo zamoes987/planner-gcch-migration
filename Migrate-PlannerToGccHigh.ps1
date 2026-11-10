@@ -1722,7 +1722,13 @@ switch ($Step) {
     'ExportTaskChat' { $null = Invoke-StepExportTaskChat }
     'ExportPremium' { $null = Invoke-StepExportPremium }
     'MapTargets' { $null = Invoke-StepMapTargets }
-    'DryRun' { Invoke-StepImportBasic -DryRun }
+    'DryRun' {
+        # Same first-run app setup as Import, so DryRun works straight after Export on a fresh machine.
+        Initialize-Prerequisites @('Graph')
+        $null = Read-MigrationSettings -Path $SettingsPath
+        Confirm-AppReady 'Destination'
+        Invoke-StepImportBasic -DryRun
+    }
     'ImportBasic' { Invoke-StepImportBasic }
     'Verify' { Invoke-StepVerify | Out-Null }
     'ImportPremium' { Invoke-StepImportPremium }
